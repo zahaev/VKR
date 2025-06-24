@@ -1,0 +1,350 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from hurst import compute_Hc
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import MinMaxScaler
+import pandas as pd
+from scipy.spatial.distance import pdist
+from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error
+
+
+# 1. Генерация временного ряда
+def generate_time_series(r, x0, n):
+    if n == 0:
+        return [x0]
+    else:
+        series = generate_time_series(r, x0, n - 1)
+        next_value = r * series[-1] * (1 - series[-1])
+        series.append(next_value)
+        return series
+
+
+# 2. Вычисление времени задержки (delay time)
+def compute_delay_time(series, max_lag=20):
+    def mutual_information(series, lag):
+        hist, _, _ = np.histogram2d(series[:-lag], series[lag:], bins=10)
+        hist = hist / np.sum(hist) if np.sum(hist) > 0 else np.zeros_like(hist)
+        return -np.sum(hist * np.log(hist + 1e-10))
+    mis = [mutual_information(series, lag) for lag in range(1, max_lag)]
+    delay = np.argmin(mis) + 1
+    return delay
+
+
+# 3. Оценка размерности вложения (embedding dimension)
+def compute_embedding_dimension(series, delay, max_dim=10):
+    def false_nearest_neighbors(series, dim, delay):
+        embedded = np.array([series[i:i + dim * delay:delay] for i in range(len(series) - dim * delay)])
+        distances = pdist(embedded)
+        threshold = np.mean(distances) * 0.1
+        fnn = np.mean([1 if d < threshold else 0 for d in distances])
+        return fnn
+    fnns = [false_nearest_neighbors(series, dim, delay) for dim in range(1, max_dim)]
+    embedding_dim = np.argmin(fnns) + 1
+    return embedding_dim
+
+
+# 4. Подготовка данных для LSTM с использованием теоремы Такенса
+def prepare_data_with_takens(series, delay, embedding_dim):
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    series = np.array(series).reshape(-1, 1)
+    series = scaler.fit_transform(series)
+    X, y = [], []
+    for i in range(len(series) - embedding_dim * delay):
+        X.append(series[i:i + embedding_dim * delay:delay, 0])
+        y.append(series[i + embedding_dim * delay, 0])
+    X = np.array(X)
+    y = np.array(y)
+    X = X.reshape(X.shape[0], X.shape[1], 1)
+    return X, y, scaler
+
+
+# 5. Создание и обучение модели LSTM
+class LSTMModel(nn.Module):
+    def __init__(self, input_size=1, hidden_layer_size=500, output_size=1):
+        super(LSTMModel, self).__init__()
+        self.hidden_layer_size = hidden_layer_size
+        self.lstm = nn.LSTM(input_size, hidden_layer_size, batch_first=True)
+        self.linear = nn.Linear(hidden_layer_size, output_size)
+
+    def forward(self, input_seq):
+        lstm_out, _ = self.lstm(input_seq)
+        predictions = self.linear(lstm_out[:, -1])
+        return predictions
+
+
+def train_lstm(model, X_train, y_train, epochs=400, lr=0.001):
+    loss_function = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    X_tensor = torch.tensor(X_train, dtype=torch.float32)
+    y_tensor = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        y_pred = model(X_tensor)
+        loss = loss_function(y_pred, y_tensor)
+        loss.backward()
+        optimizer.step()
+        if (epoch + 1) % 50 == 0:
+            print(f'Эпоха [{epoch + 1}/{epochs}], Ошибка: {loss.item():.6f}')
+
+
+# 6. Загрузка пользовательского датасета
+def load_custom_dataset(file_path=None):
+    if file_path:
+        try:
+            data = pd.read_csv(file_path)
+            if len(data.columns) > 1:
+                print("Выберите столбец для анализа:")
+                for i, col in enumerate(data.columns):
+                    print(f"{i}: {col}")
+                choice = int(input("Введите номер столбца: "))
+                series = data.iloc[:, choice].values
+            else:
+                series = data.iloc[:, 0].values
+            return series
+        except Exception as e:
+            print(f"Ошибка при загрузке файла: {e}")
+            return None
+    else:
+        print("Введите временной ряд через пробел:")
+        series = list(map(float, input().split()))
+        return series
+
+
+# 7. Функция многошагового прогноза с коррекцией на основе ошибок
+def multi_step_forecast_with_correction(
+    model, initial_sequence, correction_values, steps_ahead, scaler
+):
+    predictions = []
+    error_history = []  # Хранение ошибок для коррекции
+    current_seq = torch.tensor(initial_sequence, dtype=torch.float32).clone().detach()
+    loss_function = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    use_second_dataset = correction_values is not None and len(correction_values) >= steps_ahead
+
+    for step in range(steps_ahead):
+        with torch.no_grad():
+            pred = model(current_seq.unsqueeze(0)).item()
+        predictions.append(pred)
+
+        # Обновляем последовательность: сдвигаем окно
+        current_seq = torch.roll(current_seq, -1)
+        current_seq[-1] = pred
+
+        # Коррекция по данным второго датасета
+        if use_second_dataset and step < len(correction_values):
+            real_value = correction_values[step]
+            error = real_value - pred
+            error_history.append(error)
+            print(f"[Шаг {step+1}] Предсказано: {pred:.6f}, Истинное значение: {real_value:.6f}, Ошибка: {error:.6f}")
+
+            new_input = current_seq.numpy()
+            new_input[-1] = real_value
+            new_y = real_value
+
+            new_X_tensor = torch.tensor(new_input, dtype=torch.float32).unsqueeze(0)
+            new_y_tensor = torch.tensor([new_y], dtype=torch.float32).unsqueeze(-1)
+
+            model.train()
+            optimizer.zero_grad()
+            output = model(new_X_tensor)
+            loss = loss_function(output, new_y_tensor)
+            loss.backward()
+            optimizer.step()
+
+            current_seq = new_X_tensor.squeeze(0).detach()
+
+        elif error_history:
+            avg_error = np.mean(error_history[-5:])  # усреднение по последним 5 ошибкам
+            corrected_pred = pred + avg_error
+            print(f"[Шаг {step+1}] Прогноз скорректирован на основе ошибки: {corrected_pred:.6f}")
+
+            current_seq = torch.roll(current_seq, -1)
+            current_seq[-1] = corrected_pred
+            predictions[-1] = corrected_pred  # замена последнего предсказания
+        else:
+            print(f"[Шаг {step+1}] Прогноз без коррекции: {pred:.6f}")
+            current_seq = torch.roll(current_seq, -1)
+            current_seq[-1] = pred
+
+    return scaler.inverse_transform(np.array(predictions).reshape(-1, 1))
+
+
+# Основная часть программы
+if __name__ == "__main__":
+    print("Выберите источник данных:")
+    print("1. Сгенерировать временной ряд")
+    print("2. Загрузить из CSV файла")
+    print("3. Ввести данные вручную")
+    choice = int(input("Введите номер варианта: "))
+
+    if choice == 1:
+        r = float(input("Введите параметр r: "))
+        x0 = float(input("Введите начальное значение x0: "))
+        n = int(input("Введите длину ряда n: "))
+        time_series = generate_time_series(r, x0, n)
+    elif choice == 2:
+        file_path = input("Введите путь к CSV файлу: ")
+        time_series = load_custom_dataset(file_path)
+        if time_series is None:
+            exit()
+    elif choice == 3:
+        time_series = load_custom_dataset()
+    else:
+        print("Неверный выбор.")
+        exit()
+
+    plt.plot(time_series, label="Временной ряд")
+    plt.title("Сгенерированный/загруженный временной ряд")
+    plt.xlabel("Дни")
+    plt.ylabel("USD USA")
+    plt.legend()
+    plt.show()
+
+    delay_time = compute_delay_time(time_series)
+    embedding_dim = compute_embedding_dimension(time_series, delay_time)
+    print(f"Время задержки: {delay_time}")
+    print(f"Размерность вложения: {embedding_dim}")
+
+    X, y, scaler = prepare_data_with_takens(time_series, delay_time, embedding_dim)
+    train_size = int(len(X) * 0.7)
+    X_train, X_test = X[:train_size], X[train_size:]
+    y_train, y_test = y[:train_size], y[train_size:]
+
+    model = LSTMModel()
+
+    print("Хотите ли вы загрузить существующую модель для дообучения?")
+    load_model_choice = input("Введите 'да' или 'нет': ").lower()
+    if load_model_choice == 'да':
+        model_path = input("Введите путь к сохранённой модели (.pt): ")
+        try:
+            model.load_state_dict(torch.load(model_path))
+            print("Модель загружена.")
+        except Exception as e:
+            print(f"Ошибка при загрузке модели: {e}")
+            exit()
+
+    print("Обучать модель заново? (да/нет)")
+    retrain_choice = input("Ваш выбор: ").lower()
+    if retrain_choice == 'да':
+        epochs = int(input("Введите количество эпох обучения: "))
+        train_lstm(model, X_train, y_train, epochs=epochs)
+
+    model.eval()
+    with torch.no_grad():
+        predictions_scaled = model(torch.tensor(X_test, dtype=torch.float32)).numpy()
+    predictions = scaler.inverse_transform(predictions_scaled)
+    y_test_original = scaler.inverse_transform(y_test.reshape(-1, 1))
+
+    mape = mean_absolute_percentage_error(y_test_original, predictions) * 100
+    rmse = np.sqrt(mean_squared_error(y_test_original, predictions))
+    print(f"Средняя абсолютная процентная ошибка (MAPE): {mape:.2f}%, RMSE: {rmse:.6f}")
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(range(len(time_series)), time_series, label="Исходный ряд")
+    test_indices = range(len(time_series) - len(predictions), len(time_series))
+    plt.plot(test_indices, predictions, label="Предсказания", color="#f77b0f")
+    plt.title("Предсказание временного ряда (LSTM)")
+    plt.xlabel("Дни")
+    plt.ylabel("USD USA")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    forecast_steps = int(input("Сколько шагов вперёд хотите спрогнозировать? "))
+
+    # Предлагаем использовать второй датасет
+    print("Хотите ли вы использовать второй датасет для коррекции прогноза? (да/нет)")
+    use_second_dataset = input("Ваш выбор: ").lower() == 'да'
+    second_series = None
+    correction_values = None
+
+    if use_second_dataset:
+        print("Выберите источник второго датасета:")
+        print("1. Сгенерировать временной ряд")
+        print("2. Загрузить из CSV файла")
+        print("3. Ввести данные вручную")
+        second_choice = int(input("Введите номер варианта: "))
+
+        if second_choice == 1:
+            r_second = float(input("Введите параметр r для второго ряда: "))
+            x0_second = float(input("Введите начальное значение x0 для второго ряда: "))
+            n_second = int(input("Введите длину второго ряда: "))
+            second_series = generate_time_series(r_second, x0_second, n_second)
+        elif second_choice == 2:
+            file_path_second = input("Введите путь к CSV файлу: ")
+            second_series = load_custom_dataset(file_path_second)
+        elif second_choice == 3:
+            second_series = load_custom_dataset()
+        else:
+            print("Неверный выбор.")
+            use_second_dataset = False
+
+        if second_series is not None and len(second_series) >= forecast_steps:
+            # Нормализуем второй датасет по первому
+            second_series_scaled = scaler.transform(second_series.reshape(-1, 1))
+            correction_values = second_series_scaled.flatten()
+        else:
+            print("Длина второго датасета меньше количества шагов прогнозирования. Коррекция невозможна.")
+            use_second_dataset = False
+
+    initial_sequence = X_test[-1]
+
+    prediction_with_correction = multi_step_forecast_with_correction(
+        model, initial_sequence, correction_values, forecast_steps, scaler
+    )
+
+    # Визуализация результатов
+    plt.figure(figsize=(14, 6))
+    plt.plot(range(len(time_series)), time_series, label='Исходный ряд', color='blue')
+    test_prediction_indices = range(len(time_series) - len(predictions), len(time_series))
+    plt.plot(test_prediction_indices, predictions, label='Предсказания (тест)', color='#f77b0f')
+    forecast_indices = range(len(time_series), len(time_series) + forecast_steps)
+    # Вычисление MAPE для многошагового прогноза
+    if use_second_dataset and second_series is not None and len(second_series) >= forecast_steps:
+        true_values = second_series[:forecast_steps]
+        abs_errors = np.abs((true_values - prediction_with_correction.flatten()) / true_values)
+        mape_forecast = np.mean(abs_errors) * 100  # в процентах
+        print(f"MAPE для многошагового прогноза: {mape_forecast:.2f}%")
+    else:
+        print("Не хватает данных для вычисления MAPE для многошагового прогноза.")
+    plt.plot(forecast_indices, prediction_with_correction, label='Многошаговый прогноз', color='red')
+
+    if use_second_dataset and second_series is not None and len(second_series) >= forecast_steps:
+        plt.plot(forecast_indices, second_series[:forecast_steps],
+                 label='Второй датасет (реальные значения)', color='green', linestyle='--')
+
+    plt.title("Прогноз временного ряда: тестовые предсказания + многошаговый прогноз")
+    plt.xlabel("Дни")
+    plt.ylabel("USD USA")
+    plt.legend()
+    plt.grid(True)
+    plt.axvline(x=len(time_series) - 0.5, color='gray', linestyle='--', linewidth=1)
+    plt.tight_layout()
+    plt.show()
+
+    save_model_choice = input("Хотите сохранить обновлённую модель? (да/нет): ").lower()
+    if save_model_choice == 'да':
+        save_path = input("Введите путь для сохранения модели (например, 'updated_model.pt'): ")
+        torch.save(model.state_dict(), save_path)
+        print("Модель успешно сохранена.")
+
+    def lyapunov_exponent(series):
+        deltas = []
+        for i in range(1, len(series)):
+            delta = abs(series[i] - series[i - 1])
+            if delta > 0:
+                deltas.append(np.log(delta))
+        return np.mean(deltas) if deltas else float('nan')
+
+    lyapunov = lyapunov_exponent(time_series)
+    print(f"Показатель Ляпунова: {lyapunov:.4f}")
+    if not np.isnan(lyapunov):
+        if lyapunov < 0:
+            print("Система устойчива (показатель Ляпунова < 0).")
+        else:
+            print("Система неустойчива (показатель Ляпунова ≥ 0).")
+    else:
+        print("Не удалось рассчитать показатель Ляпунова — возможно, нулевые изменения.")

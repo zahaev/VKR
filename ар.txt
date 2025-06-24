@@ -1,0 +1,208 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from hurst import compute_Hc
+from statsmodels.tsa.ar_model import AutoReg
+from sklearn.preprocessing import MinMaxScaler
+import pandas as pd
+from scipy.spatial.distance import pdist
+from sklearn.metrics import mean_squared_error
+
+# 1. Генерация временного ряда
+def generate_time_series(r, x0, n):
+    if n == 0:
+        return [x0]
+    else:
+        series = generate_time_series(r, x0, n - 1)
+        next_value = r * series[-1] * (1 - series[-1])
+        series.append(next_value)
+        return series
+
+# 2. Вычисление времени задержки (delay time)
+def compute_delay_time(series, max_lag=20):
+    """Вычисление времени задержки с помощью взаимной информации."""
+    def mutual_information(series, lag):
+        """Вычисление взаимной информации."""
+        series = series[~np.isnan(series)]  # Удаление NaN значений
+        hist, _, _ = np.histogram2d(series[:-lag], series[lag:], bins=10)
+        hist = hist / np.sum(hist) if np.sum(hist) > 0 else np.zeros_like(hist)
+        return -np.sum(hist * np.log(hist + 1e-10))
+    
+    mis = [mutual_information(series, lag) for lag in range(1, max_lag)]
+    delay = np.argmin(mis) + 1  # Первый минимум взаимной информации
+    return delay
+
+# 3. Оценка размерности вложения (embedding dimension)
+def compute_embedding_dimension(series, delay, max_dim=10):
+    """Оценка размерности вложения с помощью метода ложных ближайших соседей."""
+    def false_nearest_neighbors(series, dim, delay):
+        """Оценка ложных ближайших соседей."""
+        max_len = len(series) - dim * delay
+        if max_len <= 0:
+            return 1.0  # Недостаточно данных для вложения
+
+        embedded = np.array([series[i:i + dim * delay:delay] for i in range(max_len)])
+        if embedded.size == 0 or embedded.ndim != 2:
+            return 1.0  # Возвращаем максимальное значение FNN, если массив некорректный
+
+        distances = pdist(embedded)
+        threshold = np.mean(distances) * 0.1
+        fnn = np.mean([1 if d < threshold else 0 for d in distances])
+        return fnn
+    
+    fnns = [false_nearest_neighbors(series, dim, delay) for dim in range(1, max_dim)]
+    embedding_dim = np.argmin(fnns) + 1
+    return embedding_dim
+
+# 4. Подготовка данных для AR модели
+def prepare_data_for_ar(series, delay, embedding_dim):
+    """Подготовка данных для авторегрессионной модели."""
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    series = np.array(series).reshape(-1, 1)
+    series = scaler.fit_transform(series)  # Нормализация данных
+    
+    X, y = [], []
+    for i in range(len(series) - embedding_dim * delay):
+        X.append(series[i:i + embedding_dim * delay:delay, 0])  # Метод задержек
+        y.append(series[i + embedding_dim * delay, 0])
+    
+    X = np.array(X)
+    y = np.array(y)
+    return X, y, scaler
+
+# 5. Загрузка пользовательского датасета
+def load_custom_dataset(file_path=None):
+    if file_path:
+        try:
+            # Чтение данных из CSV файла
+            data = pd.read_csv(file_path)
+            if len(data.columns) > 1:
+                print("Выберите столбец для анализа:")
+                for i, col in enumerate(data.columns):
+                    print(f"{i}: {col}")
+                choice = int(input("Введите номер столбца: "))
+                series = data.iloc[:, choice].values
+            else:
+                series = data.iloc[:, 0].values
+            return series
+        except Exception as e:
+            print(f"Ошибка при загрузке файла: {e}")
+            return None
+    else:
+        # Ввод данных вручную
+        print("Введите временной ряд через пробел:")
+        series = list(map(float, input().split()))
+        return series
+
+# Основная часть программы
+if __name__ == "__main__":
+    print("Выберите источник данных:")
+    print("1. Сгенерировать временной ряд")
+    print("2. Загрузить из CSV файла")
+    print("3. Ввести данные вручную")
+    choice = int(input("Введите номер варианта: "))
+
+    if choice == 1:
+        r = float(input("Введите параметр r: "))
+        x0 = float(input("Введите начальное значение x0: "))
+        n = int(input("Введите длину ряда n: "))
+        time_series = generate_time_series(r, x0, n)
+    elif choice == 2:
+        file_path = input("Введите путь к CSV файлу: ")
+        time_series = load_custom_dataset(file_path)
+        if time_series is None:
+            exit()
+    elif choice == 3:
+        time_series = load_custom_dataset()
+    else:
+        print("Неверный выбор.")
+        exit()
+
+    # Проверка и предварительная обработка данных
+    time_series = np.array(time_series)
+    time_series = time_series[~np.isnan(time_series)]  # Удаление NaN
+    time_series = time_series[np.isfinite(time_series)]  # Удаление Inf
+
+    # Визуализация временного ряда
+    plt.plot(time_series, label="Временной ряд")
+    plt.title("Сгенерированный/загруженный временной ряд")
+    plt.xlabel("День")
+    plt.ylabel("Значение")
+    plt.legend()
+    plt.show()
+
+    # Вычисление параметров для теоремы Такенса
+    delay_time = compute_delay_time(time_series)
+    max_dim = min(10, len(time_series) // delay_time)  # Ограничиваем максимальную размерность
+    embedding_dim = compute_embedding_dimension(time_series, delay_time, max_dim=max_dim)
+
+    print(f"Время задержки: {delay_time}")
+    print(f"Размерность вложения: {embedding_dim}")
+
+    # Подготовка данных для AR модели
+    X, y, scaler = prepare_data_for_ar(time_series, delay_time, embedding_dim)
+
+    # Разделение на обучающую и тестовую выборки
+    train_size = int(len(X) * 0.7)
+    X_train, X_test = X[:train_size], X[train_size:]
+    y_train, y_test = y[:train_size], y[train_size:]
+
+    # Обучение AR модели
+    ar_model = AutoReg(y_train, lags=embedding_dim)
+    ar_result = ar_model.fit()
+
+    # Предсказание на тестовой выборке
+    predictions_scaled = ar_result.predict(start=len(y_train), end=len(y_train) + len(y_test) - 1)
+    predictions = scaler.inverse_transform(np.array(predictions_scaled).reshape(-1, 1))  # Денормализация
+    y_test_original = scaler.inverse_transform(y_test.reshape(-1, 1))  # Денормализация
+
+    # Вычисление среднеквадратичной ошибки (MSE) и корня из MSE (RMSE)
+
+    mse = mean_squared_error(y_test_original, predictions)
+    rmse = np.sqrt(mse)
+    print(f"Среднеквадратичная ошибка (MSE): {mse}")
+        # Вычисление средней абсолютной процентной ошибки (MAPE)
+    def mean_absolute_percentage_error(y_true, y_pred):
+        y_true, y_pred = np.array(y_true), np.array(y_pred)
+        non_zero = y_true != 0  # Исключаем деление на ноль
+        return np.mean(np.abs((y_true[non_zero] - y_pred[non_zero]) / y_true[non_zero])) * 100
+
+    mape = mean_absolute_percentage_error(y_test_original, predictions)
+    print(f"Средняя абсолютная процентная ошибка (MAPE): {mape:.2f}%")
+    # Визуализация предсказаний
+    plt.plot(range(len(time_series)), time_series, label="Исходный ряд")
+    plt.plot(range(len(time_series) - len(predictions), len(time_series)), predictions, label="Предсказания")
+    plt.title("Предсказание временного ряда (AR)")
+    plt.xlabel("Время")
+    plt.ylabel("Значение")
+    plt.legend()
+    plt.show()
+
+    # Проверка гипотезы H = 0.5
+    def check_hurst_exponent(series):
+        H, c, data = compute_Hc(series, kind='change', simplified=True)
+        return H
+
+    H = check_hurst_exponent(time_series)
+    print(f"Показатель Хёрста (H): {H}")
+    if abs(H - 0.5) < 0.05:
+        print("Гипотеза H = 0.5 не отвергается.")
+    else:
+        print("Гипотеза H = 0.5 отвергается.")
+
+    # Оценка показателя Ляпунова
+    def lyapunov_exponent(series):
+        n = len(series)
+        deltas = []
+        for i in range(1, n):
+            delta = abs(series[i] - series[i - 1])
+            if delta > 0:
+                deltas.append(np.log(delta))
+        return np.mean(deltas)
+
+    lyapunov = lyapunov_exponent(time_series)
+    print(f"Показатель Ляпунова: {lyapunov}")
+    if lyapunov < 0:
+        print("Система устойчива (показатель Ляпунова < 0).")
+    else:
+        print("Система неустойчива (показатель Ляпунова >= 0).")
+    print(f"Порядок AR модели (lags): {embedding_dim}")
