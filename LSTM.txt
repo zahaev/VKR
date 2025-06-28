@@ -239,8 +239,7 @@ if __name__ == "__main__":
     y_test_original = scaler.inverse_transform(y_test.reshape(-1, 1))
 
     mape = mean_absolute_percentage_error(y_test_original, predictions) * 100
-    rmse = np.sqrt(mean_squared_error(y_test_original, predictions))
-    print(f"Средняя абсолютная процентная ошибка (MAPE): {mape:.2f}%, RMSE: {rmse:.6f}")
+    print(f"Средняя абсолютная процентная ошибка (MAPE): {mape:.2f}%")
 
     plt.figure(figsize=(12, 6))
     plt.plot(range(len(time_series)), time_series, label="Исходный ряд")
